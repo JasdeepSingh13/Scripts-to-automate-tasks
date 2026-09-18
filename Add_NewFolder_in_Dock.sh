@@ -1,5 +1,11 @@
 #!/bin/bash
 
+########################################################
+
+# Author: Jasdeep Singh (jasdeep_singh@yahoo.co.in)
+
+########################################################
+
 # Specify the path of the existing folder
 folderPath="/path/to/existing/folder"
 
