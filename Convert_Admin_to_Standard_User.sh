@@ -1,5 +1,10 @@
 #!/bin/sh
 
+########################################################
+
+# Author: Jasdeep Singh (jasdeep_singh@yahoo.co.in)
+
+########################################################
 
 #
 #     Convert_Admin_to_Standard_User.sh
