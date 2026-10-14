@@ -1,0 +1,164 @@
+#!/bin/bash
+
+# Self Service script: toggle UAT membership via SwiftDialog + flag file + Smart Group
+# Checks for swiftDialog, installs via Jamf custom trigger if missing
+# Robust button detection + logging for troubleshooting
+
+dialogBin="/usr/local/bin/dialog"
+flagDir="/Library/Application Support/YourOrg"
+flagFile="${flagDir}/uat_flag"
+logFile="/Library/Application Support/YourOrg/uat_toggle.log"
+maxWaitSeconds=60
+waitInterval=5
+
+# --- Branding assets ---
+brandingDir="/Library/Application Support/YourOrg/UATGroup"
+bannerImage="${brandingDir}/YourOrg_SD_BannerImage.png"
+iconImage="${brandingDir}/YourOrg_Logo.png"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$logFile"
+}
+
+mkdir -p "$flagDir"
+log "----- Script started -----"
+
+# --- Check if swiftDialog is installed ---
+if [[ ! -x "$dialogBin" ]]; then
+    log "swiftDialog not found. Triggering install policy 'install_swiftdialog'..."
+    sudo jamf policy -event install_swiftdialog
+
+    elapsed=0
+    while [[ ! -x "$dialogBin" && $elapsed -lt $maxWaitSeconds ]]; do
+        sleep "$waitInterval"
+        elapsed=$((elapsed + waitInterval))
+        log "Waiting for swiftDialog install... (${elapsed}s elapsed)"
+    done
+
+    if [[ ! -x "$dialogBin" ]]; then
+        log "ERROR: swiftDialog still not found after install attempt. Exiting."
+        exit 1
+    else
+        log "swiftDialog installed successfully."
+    fi
+else
+    log "swiftDialog already installed. Proceeding."
+fi
+
+# --- Check branding assets exist (fall back gracefully if missing) ---
+bannerArg=()
+iconArg=()
+
+if [[ -f "$bannerImage" ]]; then
+    bannerArg=(--bannerimage "$bannerImage" --bannertitle "UAT Group Membership")
+    log "Banner image found at ${bannerImage}"
+else
+    log "WARNING: Banner image not found at ${bannerImage}. Proceeding without banner."
+fi
+
+if [[ -f "$iconImage" ]]; then
+    iconArg=(--icon "$iconImage")
+    log "Icon image found at ${iconImage}"
+else
+    log "WARNING: Icon image not found at ${iconImage}. Falling back to SF Symbol."
+    iconArg=(--icon "SF=person.2.badge.gearshape")
+fi
+
+# --- Determine current status for the message ---
+if [[ -f "$flagFile" ]]; then
+    currentStatus="You are currently a member of the UAT group. UAT (User Acceptance Testing) gives you early access to new features and updates before they roll out to everyone, so you can help test and share feedback. Click Remove from UAT to opt out."
+else
+    currentStatus="You are currently not a member of the UAT group. UAT (User Acceptance Testing) gives you early access to new features and updates before they roll out to everyone, so you can help test and share feedback. Click Add to UAT to opt in."
+fi
+
+# --- Show dialog with Add/Remove buttons ---
+dialogOutput=$("$dialogBin" \
+    --title "UAT Group Membership" \
+    --message "${currentStatus}\n\nChoose an action below:" \
+    "${bannerArg[@]}" \
+    "${iconArg[@]}" \
+    --button1text "Add to UAT" \
+    --button2text "Remove from UAT" \
+    --moveable \
+    --ontop \
+    --json)
+
+dialogExitCode=$?
+log "Dialog raw output: ${dialogOutput}"
+log "Dialog exit code: ${dialogExitCode}"
+
+# --- Robust button detection: try multiple known key casings, then fall back to exit code ---
+action=""
+
+if echo "$dialogOutput" | grep -qi '"button1Pressed"[[:space:]]*:[[:space:]]*true' ||
+   echo "$dialogOutput" | grep -qi '"button1pressed"[[:space:]]*:[[:space:]]*true'; then
+    action="add"
+elif echo "$dialogOutput" | grep -qi '"button2Pressed"[[:space:]]*:[[:space:]]*true' ||
+     echo "$dialogOutput" | grep -qi '"button2pressed"[[:space:]]*:[[:space:]]*true'; then
+    action="remove"
+elif [[ "$dialogExitCode" == "0" ]]; then
+    action="add"
+elif [[ "$dialogExitCode" == "2" ]]; then
+    action="remove"
+fi
+
+if [[ -z "$action" ]]; then
+    log "No valid button selection detected (exit code ${dialogExitCode}). Dialog likely cancelled. Exiting without changes."
+    exit 0
+fi
+
+log "Detected action: ${action}"
+
+# --- Act based on detected action ---
+if [[ "$action" == "add" ]]; then
+    touch "$flagFile"
+    resultMsg="You have been added to the UAT group. To Leave UAT group, run this same policy again and choose Remove from UAT. Your Mac will return to the standard release. Thank you for your contribution."
+    log "Flag file created at ${flagFile}"
+elif [[ "$action" == "remove" ]]; then
+    rm -f "$flagFile"
+    resultMsg="You have been removed from the UAT group. To Join UAT group again, run this same policy and choose Add to UAT. Thank you for your contribution."
+    log "Flag file removed from ${flagFile}"
+fi
+
+# --- Verify flag state actually matches intended action ---
+if [[ "$action" == "add" && ! -f "$flagFile" ]]; then
+    log "ERROR: Flag file was not created as expected."
+    exit 1
+elif [[ "$action" == "remove" && -f "$flagFile" ]]; then
+    log "ERROR: Flag file was not removed as expected."
+    exit 1
+fi
+
+# --- Push inventory update so Smart Group reflects the change ---
+log "Running jamf recon..."
+sudo jamf recon -verbose >> "$logFile" 2>&1
+reconExit=$?
+log "jamf recon exit code: ${reconExit}"
+
+if [[ "$reconExit" != "0" ]]; then
+    log "WARNING: jamf recon may not have completed successfully. Check log above."
+fi
+
+# --- Confirmation dialog (uses branding images before they might be deleted below) ---
+"$dialogBin" \
+    --title "UAT Group Membership" \
+    --message "${resultMsg}" \
+    "${bannerArg[@]}" \
+    "${iconArg[@]}" \
+    --button1text "OK" \
+    --moveable \
+    --ontop
+
+# --- If action was "remove", clean up the branding folder after confirmation shown ---
+if [[ "$action" == "remove" ]]; then
+    if [[ -d "$brandingDir" ]]; then
+        rm -rf "$brandingDir"
+        log "Removed branding folder at ${brandingDir}"
+    else
+        log "Branding folder ${brandingDir} not found; nothing to remove."
+    fi
+fi
+
+log "Action completed: ${action}"
+log "----- Script finished -----"
+exit 0
