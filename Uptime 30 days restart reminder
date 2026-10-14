@@ -1,0 +1,312 @@
+#!/bin/zsh
+#
+# UpTime
+#
+######################################################################################################
+#
+# Global "Common" variables
+#
+######################################################################################################
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+SCRIPT_NAME="UpTime"
+LOGGED_IN_USER=$( scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }' )
+USER_DIR=$( dscl . -read /Users/${LOGGED_IN_USER} NFSHomeDirectory | awk '{ print $2 }' )
+USER_UID=$(id -u "$LOGGED_IN_USER")
+
+FREE_DISK_SPACE=$(($( /usr/sbin/diskutil info / | /usr/bin/grep "Free Space" | /usr/bin/awk '{print $6}' | /usr/bin/cut -c 2- ) / 1024 / 1024 / 1024 ))
+MACOS_NAME=$(sw_vers -productName)
+MACOS_VERSION=$(sw_vers -productVersion)
+MAC_RAM=$(($(sysctl -n hw.memsize) / 1024**3))" GB"
+MAC_CPU=$(sysctl -n machdep.cpu.brand_string)
+
+ICON_FILES="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/"
+
+# Swift Dialog version requirements
+
+SW_DIALOG="/usr/local/bin/dialog"
+MIN_SD_REQUIRED_VERSION="3.1.0"
+[[ -e "${SW_DIALOG}" ]] && SD_VERSION=$( ${SW_DIALOG} --version) || SD_VERSION="0.0.0"
+
+HOUR=$(date +%H)
+case $HOUR in
+    0[0-9]|1[0-1]) GREET="day" ;;
+    1[2-7])        GREET="day" ;;
+    *)             GREET="day" ;;
+esac
+SD_DIALOG_GREETING="Good $GREET"
+
+###################################################
+#
+# App Specific variables (Feel free to change these)
+#
+###################################################
+   
+# See if there is a "defaults" file...if so, read in the contents
+DEFAULTS_DIR="/Library/Managed Preferences/com.YourOrg.uptimenudge.plist"
+if [[ -f "$DEFAULTS_DIR" ]]; then
+    echo "Found Defaults Files.  Reading in Info"
+    SUPPORT_DIR=$(defaults read "$DEFAULTS_DIR" SupportFiles)
+    SD_BANNER_IMAGE=$(defaults read "$DEFAULTS_DIR" BannerImage)
+    BANNER_TEXT_PADDING=$(defaults read "$DEFAULTS_DIR" BannerPadding)
+    BANNER_SUBTITLE=$(defaults read "$DEFAULTS_DIR" BannerSubtitle)
+    BANNER_TEXT_COLOR=$(defaults read "$DEFAULTS_DIR" TitleFontColor)
+else
+    SUPPORT_DIR="/Library/Application Support/YourOrg/UptimeReminderSupportFiles"
+    SD_BANNER_IMAGE="YourOrg_SD_BannerImage.png"
+    BANNER_TEXT_PADDING=10 #10 spaces to accommodate for icon offset
+    BANNER_SUBTITLE="A message from YourOrg IT"
+fi
+[[ -e $SUPPORT_DIR/$SD_BANNER_IMAGE ]] && SD_BANNER_IMAGE="$SUPPORT_DIR/$SD_BANNER_IMAGE"
+[[ -z "$BANNER_TEXT_COLOR" ]] && BANNER_TEXT_COLOR="white"
+[[ -z "$BANNER_SUBTITLE" ]] && BANNER_SUBTITLE="A message from YourOrg IT"
+
+# --- All dialog verbiage is customizable via the same defaults plist. ---
+# Reading these unconditionally (not inside the if/else above) means it works
+# whether the plist is entirely absent OR present-but-missing-some-keys - each
+# line just falls back to the hardcoded default below if the key isn't set.
+# Supported tokens inside WELCOME_MESSAGE / RESTART_MESSAGE:
+#   {{GREETING}} {{FIRST_NAME}} {{UPTIME_DAYS_ACTUAL}} {{UPTIME_THRESHOLD}} {{RESTART_TIMER}}
+
+WINDOW_TITLE=$(defaults read "$DEFAULTS_DIR" WindowTitle 2>/dev/null)
+INFOBOX_HEADER=$(defaults read "$DEFAULTS_DIR" InfoBoxHeader 2>/dev/null)
+WELCOME_MESSAGE=$(defaults read "$DEFAULTS_DIR" WelcomeMessage 2>/dev/null)
+WELCOME_BUTTON1_TEXT=$(defaults read "$DEFAULTS_DIR" WelcomeButton1Text 2>/dev/null)
+WELCOME_BUTTON2_TEXT=$(defaults read "$DEFAULTS_DIR" WelcomeButton2Text 2>/dev/null)
+RESTART_MESSAGE=$(defaults read "$DEFAULTS_DIR" RestartMessage 2>/dev/null)
+RESTART_BUTTON1_TEXT=$(defaults read "$DEFAULTS_DIR" RestartButton1Text 2>/dev/null)
+MESSAGE_FONT_SIZE=$(defaults read "$DEFAULTS_DIR" MessageFontSize 2>/dev/null)
+WELCOME_DIALOG_HEIGHT=$(defaults read "$DEFAULTS_DIR" WelcomeDialogHeight 2>/dev/null)
+RESTART_DIALOG_HEIGHT=$(defaults read "$DEFAULTS_DIR" RestartDialogHeight 2>/dev/null)
+
+[[ -z "$WINDOW_TITLE" ]] && WINDOW_TITLE="System Restart Reminder"
+[[ -z "$INFOBOX_HEADER" ]] && INFOBOX_HEADER="## System Info ##"
+[[ -z "$WELCOME_BUTTON1_TEXT" ]] && WELCOME_BUTTON1_TEXT="Restart Now"
+[[ -z "$WELCOME_BUTTON2_TEXT" ]] && WELCOME_BUTTON2_TEXT="Remind Later"
+[[ -z "$RESTART_BUTTON1_TEXT" ]] && RESTART_BUTTON1_TEXT="Restart Now"
+[[ -z "$MESSAGE_FONT_SIZE" ]] && MESSAGE_FONT_SIZE="16"
+[[ -z "$WELCOME_DIALOG_HEIGHT" ]] && WELCOME_DIALOG_HEIGHT="480"
+[[ -z "$RESTART_DIALOG_HEIGHT" ]] && RESTART_DIALOG_HEIGHT="300"
+[[ -z "$WELCOME_MESSAGE" ]] && WELCOME_MESSAGE="{{GREETING}} {{FIRST_NAME}}! This is an automated message from IT team to let you know that it has been over {{UPTIME_DAYS_ACTUAL}} days since your system was last restarted. It is highly recommended that you restart your Mac at least once every {{UPTIME_THRESHOLD}} days to keep it running smoothly and secured with latest updates.<br><br>You can choose Restart Now, and it will start a {{RESTART_TIMER}} minutes count down timer before the system restarts. Please take this time to save your important work.<br><br>If you do not restart now, then you will get a reminder in next 3 days again."
+[[ -z "$RESTART_MESSAGE" ]] && RESTART_MESSAGE="Your Mac will restart after the timer has finished its count down, or you can choose to restart immediately. Please take this time to save your important work."
+
+# Log files location
+
+LOG_FILE="${SUPPORT_DIR}/logs/${SCRIPT_NAME}.log"
+
+# Display items (banner / icon)
+
+SD_WINDOW_TITLE="$WINDOW_TITLE"
+OVERLAY_ICON="${SUPPORT_DIR}/Uptime.png"
+
+# Trigger installs for Images & icons & swiftDialog itself
+
+SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
+DIALOG_ICON_TRIGGER="install_uptimeicon"
+DIALOG_INSTALL_POLICY="install_swiftdialog"
+
+##################################################
+#
+# Passed in variables
+# 
+#################################################
+
+JAMF_LOGGED_IN_USER=${3:-"$LOGGED_IN_USER"}    # Passed in by JAMF automatically
+
+# Pull the account's actual Real Name rather than guessing from the username -
+# this works regardless of whether the login username follows a firstname.lastname
+# pattern. dscl sometimes wraps the value onto its own line (leading space, no
+# "RealName:" prefix) when it contains a space, so both sed passes are needed.
+REAL_NAME=$(dscl . -read "/Users/${JAMF_LOGGED_IN_USER}" RealName 2>/dev/null | sed 's/^RealName: //' | sed 's/^ //' | tail -1)
+SD_FIRST_NAME="${(C)REAL_NAME%% *}"
+# Fall back to the old username-splitting behavior if RealName lookup came back empty
+[[ -z "$SD_FIRST_NAME" ]] && SD_FIRST_NAME="${(C)JAMF_LOGGED_IN_USER%%.*}"
+UPTIME_DAYS="${4:-"30"}"
+RESTART_TIMER="${5:-"5"}"
+
+####################################################################################################
+#
+# Functions
+#
+####################################################################################################
+
+function create_log_directory ()
+{
+    # Ensure that the log directory and the log files exist. If they
+    # do not then create them and set the permissions.
+    #
+    # RETURN: None
+
+	# If the log directory doesn't exist - create it and set the permissions (using zsh parameter expansion to get directory)
+	LOG_DIR=${LOG_FILE%/*}
+	[[ ! -d "${LOG_DIR}" ]] && /bin/mkdir -p "${LOG_DIR}"
+	/bin/chmod 755 "${LOG_DIR}"
+
+	# If the log file does not exist - create it and set the permissions
+	[[ ! -f "${LOG_FILE}" ]] && /usr/bin/touch "${LOG_FILE}"
+	/bin/chmod 644 "${LOG_FILE}"
+}
+
+function logMe () 
+{
+    # Basic two pronged logging function that will log like this:
+    #
+    # 20231204 12:00:00: Some message here
+    #
+    # This function logs both to STDOUT/STDERR and a file
+    # The log file is set by the $LOG_FILE variable.
+    #
+    # RETURN: None
+    echo "$(/bin/date '+%Y-%m-%d %H:%M:%S'): ${1}" | tee -a "${LOG_FILE}"
+}
+
+function check_swift_dialog_install ()
+{
+    # Check to make sure that Swift Dialog is installed and functioning correctly
+    # Will install process if missing or corrupted
+    #
+    # RETURN: None
+
+    logMe "Ensuring that swiftDialog version is installed..."
+    if [[ ! -x "${SW_DIALOG}" ]]; then
+        logMe "Swift Dialog is missing or corrupted - Installing from JAMF"
+        install_swift_dialog
+    fi
+    SD_VERSION=$( ${SW_DIALOG} --version) 
+    if ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
+        logMe "Swift Dialog is outdated - Installing version '${MIN_SD_REQUIRED_VERSION}' from JAMF..."
+        install_swift_dialog
+    else    
+        logMe "Swift Dialog is currently running: ${SD_VERSION}"
+    fi
+}
+
+function install_swift_dialog ()
+{
+    # Install Swift dialog From JAMF
+    # PARMS Expected: DIALOG_INSTALL_POLICY - policy trigger from JAMF
+    #
+    # RETURN: None
+
+	/usr/local/bin/jamf policy -event ${DIALOG_INSTALL_POLICY}
+}
+
+function check_support_files ()
+{
+    [[ ! -e "${SD_BANNER_IMAGE}" ]] && [[ "${SD_BANNER_IMAGE}" =~ \.(jpg|png|heic)$ ]] && /usr/local/bin/jamf policy -event ${SUPPORT_FILE_INSTALL_POLICY}
+    [[ ! -e "${OVERLAY_ICON}" ]] && /usr/local/bin/jamf policy -event ${DIALOG_ICON_TRIGGER}
+}
+
+function create_infobox_message()
+{
+	################################
+	#
+	# Swift Dialog InfoBox message construct
+	#
+	################################
+
+	SD_INFO_BOX_MSG="${INFOBOX_HEADER}<br>"
+	SD_INFO_BOX_MSG+="${MAC_CPU}<br>"
+	SD_INFO_BOX_MSG+="{serialnumber}<br>"
+	SD_INFO_BOX_MSG+="${MAC_RAM} RAM<br>"
+	SD_INFO_BOX_MSG+="${FREE_DISK_SPACE}GB Available<br>"
+	SD_INFO_BOX_MSG+="{osname} {osversion}<br>"
+}
+
+function cleanup_and_exit ()
+{
+	[[ -f ${JSON_OPTIONS} ]] && /bin/rm -rf ${JSON_OPTIONS}
+	[[ -f ${TMP_FILE_STORAGE} ]] && /bin/rm -rf ${TMP_FILE_STORAGE}
+    [[ -f ${DIALOG_COMMAND_FILE} ]] && /bin/rm -rf ${DIALOG_COMMAND_FILE}
+	exit $1
+}
+
+function welcomemsg ()
+{
+    
+    messagebody="${WELCOME_MESSAGE}"
+    messagebody="${messagebody//\{\{GREETING\}\}/$SD_DIALOG_GREETING}"
+    messagebody="${messagebody//\{\{FIRST_NAME\}\}/$SD_FIRST_NAME}"
+    messagebody="${messagebody//\{\{UPTIME_DAYS_ACTUAL\}\}/${uptimeDays:-0}}"
+    messagebody="${messagebody//\{\{UPTIME_THRESHOLD\}\}/$UPTIME_DAYS}"
+    messagebody="${messagebody//\{\{RESTART_TIMER\}\}/$RESTART_TIMER}"
+
+    MainDialogBody=(
+        --message "${messagebody}"
+        --messagefont size="${MESSAGE_FONT_SIZE}"
+        --icon "${OVERLAY_ICON}"
+        --overlayicon --computer
+        --height "${WELCOME_DIALOG_HEIGHT}"
+        --ontop
+        --bannerimage "${SD_BANNER_IMAGE}"
+        --subtitle "${BANNER_SUBTITLE}"
+        --bannertitle "${SD_WINDOW_TITLE}"
+        --infobox "${SD_INFO_BOX_MSG}"
+        --titlefont shadow=1,color="${BANNER_TEXT_COLOR}",offset="${BANNER_TEXT_PADDING}"
+        --moveable
+        --button2text "${WELCOME_BUTTON2_TEXT}"
+        --button1text "${WELCOME_BUTTON1_TEXT}"
+        --buttonstyle center
+    )
+
+    # Show the dialog screen and allow the user to choose
+
+    "${SW_DIALOG}" "${MainDialogBody[@]}" 2>/dev/null
+    buttonpress=$?
+
+    # User wants to continue, so retart the computer
+
+    [[ ${buttonpress} -eq 0 ]] && display_restart_timer
+    logMe "INFO: User chose to defer at this time."
+}
+
+function display_restart_timer ()
+{
+    messagebody="${RESTART_MESSAGE}"
+    messagebody="${messagebody//\{\{RESTART_TIMER\}\}/$RESTART_TIMER}"
+
+    MainDialogBody=(
+    --message "${messagebody}"
+    --messagefont size="${MESSAGE_FONT_SIZE}"
+    --icon "${OVERLAY_ICON}"
+    --height "${RESTART_DIALOG_HEIGHT}"
+    --ontop
+    --bannerimage "${SD_BANNER_IMAGE}"
+    --subtitle "${BANNER_SUBTITLE}"
+    --bannertitle "${SD_WINDOW_TITLE}"
+    --titlefont shadow=1,color="${BANNER_TEXT_COLOR}",offset="${BANNER_TEXT_PADDING}"
+    --moveable
+    --timer $((RESTART_TIMER*60))
+    --button1text "${RESTART_BUTTON1_TEXT}"
+    )
+
+    logMe "INFO: User chose to restart now...starting $RESTART_TIMER timer"
+    
+    "${SW_DIALOG}" "${MainDialogBody[@]}" 2>/dev/null
+
+    osascript -e 'tell app "System Events" to restart'
+    if [[ $? -ne 0 ]]; then
+        logMe "Performing restart of system at this time."
+        sudo shutdown -r now
+    fi
+}
+
+####################################################################################################
+#
+# Main Program
+#
+####################################################################################################
+
+declare uptimeDays
+
+autoload 'is-at-least'
+
+# Special condition for JAMF...if the user restart, but the JAMF recon hasn't been run yet, then JAMF still thinks the computer needs restarted
+uptimeOutput=$(uptime)
+[[ "${uptimeOutput/day/}" != "${uptimeOutput}" ]] && uptimeDays=$(echo $uptimeOutput | awk -F "up | day" '{print $2}') || exit 0
+
+check_swift_dialog_install
+check_support_files
+create_infobox_message
+welcomemsg
+exit 0
